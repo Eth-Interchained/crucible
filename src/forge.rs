@@ -26,6 +26,33 @@ fn trial_id(file_sha: &str, c: &Candidate) -> String {
     format!("{:x}", h.finalize())[..16].to_string()
 }
 
+/// Take up to `n` jobs, one per file in rotation, so a cap samples the repo
+/// rather than its alphabetically-first module.
+fn round_robin_by_file(jobs: Vec<Job>, n: usize) -> Vec<Job> {
+    let mut buckets: std::collections::BTreeMap<PathBuf, std::collections::VecDeque<Job>> =
+        std::collections::BTreeMap::new();
+    for j in jobs {
+        buckets.entry(j.rel.clone()).or_default().push_back(j);
+    }
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let mut progressed = false;
+        for q in buckets.values_mut() {
+            if out.len() >= n {
+                break;
+            }
+            if let Some(j) = q.pop_front() {
+                out.push(j);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
+}
+
 struct Job {
     rel: PathBuf,
     report_index: usize,
@@ -44,7 +71,7 @@ pub fn run(target: &Target, opts: &Opts) -> Result<Assay, String> {
     let commit = worktree::head_commit(&repo)?;
     let started = Instant::now();
 
-    let files = locate::discover(&repo, &target.sources, &target.extension);
+    let files = locate::discover(&repo, &target.sources, &target.extension, &target.exclude);
     if files.is_empty() {
         return Err(format!(
             "no .{} files under {:?} in {} — check the target's `sources`",
@@ -106,7 +133,15 @@ pub fn run(target: &Target, opts: &Opts) -> Result<Assay, String> {
     }
     let candidates_seen = jobs.len();
     if let Some(n) = opts.limit {
-        jobs.truncate(n);
+        // SPREAD ACROSS FILES, do not take the first N.
+        //
+        // `truncate` plus a worker that pops from the end meant the whole of a
+        // limited run came from whichever file sorted first: the first Rust run
+        // spent all five trials inside `src/bin/nedb-cli.rs`. A capped run is
+        // supposed to be a SAMPLE of the repo, and a sample that describes one
+        // file is not one. Same flaw I had already fixed in pair sampling and
+        // did not carry back here.
+        jobs = round_robin_by_file(jobs, n);
     }
     flair::note(&format!(
         "{} candidates across {} files · {} refused as uncompilable by the locator{}",

@@ -53,6 +53,17 @@ impl Baseline {
 pub struct RunOutcome {
     pub ok: bool,
     pub timed_out: bool,
+    /// The grader's command could not be executed at all — `timeout` exits 127
+    /// for a missing binary and 126 for one that is not executable.
+    ///
+    /// THIS IS A DISTINCT OUTCOME BECAUSE CONFLATING IT COST ME A DIAGNOSIS.
+    /// A Rust run reported "the grader is not green on an unmutated tree" after
+    /// exiting in 1 ms; the suite was in fact perfectly green (71 tests, 0.31 s)
+    /// and `cargo` simply was not on PATH for that invocation. "Your tests are
+    /// failing" and "your test command does not exist" are different problems
+    /// with different fixes, and a tool that says the first when it means the
+    /// second sends you to read the wrong code.
+    pub not_executable: bool,
     pub tail: String,
     pub elapsed_ms: u64,
 }
@@ -80,6 +91,9 @@ pub fn run_grader(cwd: &Path, g: &Grader, deadline_ms: u64) -> Result<RunOutcome
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let code = out.status.code();
     let timed_out = code == Some(124) || code == Some(137);
+    // 127 = not found, 126 = found but not executable. `timeout` passes these
+    // through from the shell convention, and a suite cannot fail this fast.
+    let not_executable = (code == Some(127) || code == Some(126)) && elapsed_ms < 2_000;
     // The tail is what a real agent would be staring at, so it is kept verbatim
     // from the END of the output (assertions land last) rather than summarised.
     let combined = format!(
@@ -105,6 +119,7 @@ pub fn run_grader(cwd: &Path, g: &Grader, deadline_ms: u64) -> Result<RunOutcome
     Ok(RunOutcome {
         ok: out.status.success(),
         timed_out,
+        not_executable,
         tail,
         elapsed_ms,
     })
@@ -131,6 +146,21 @@ pub fn measure_baseline(
         ms.insert(g.name.clone(), r.elapsed_ms);
         deadline_ms.insert(g.name.clone(), d);
         on_result(&g.name, r.elapsed_ms, d, r.ok);
+        if r.not_executable {
+            // Named separately and FIRST, because it is the one failure here
+            // that is not about the target's code at all.
+            return Err(format!(
+                "the grader `{}` could not be executed: `{}` was not found or is not \
+                 executable (exit {:?} after {} ms). This is a PATH or toolchain \
+                 problem in the environment crucible was launched from, not a \
+                 failing test suite — check `command -v {}`.",
+                g.name,
+                g.argv.first().map(String::as_str).unwrap_or("(empty argv)"),
+                127,
+                r.elapsed_ms,
+                g.argv.first().map(String::as_str).unwrap_or("?")
+            ));
+        }
         if !r.ok {
             red.push(format!(
                 "{} ({})",
@@ -138,7 +168,7 @@ pub fn measure_baseline(
                 if r.timed_out {
                     "timed out".to_string()
                 } else {
-                    format!("exit {:?}", r.ok)
+                    "tests failed".to_string()
                 }
             ));
         }
@@ -161,6 +191,17 @@ pub fn grade(cwd: &Path, graders: &[&Grader], base: &Baseline) -> Result<Verdict
     for g in graders {
         let d = base.deadline_for(&g.name);
         let r = run_grader(cwd, g, d)?;
+        if r.not_executable {
+            // A missing grader is NOT a kill. Counting it as one would mark
+            // every trial in the run as a detected defect and produce a corpus
+            // of rows whose "failing output" is a shell error.
+            return Err(format!(
+                "the grader `{}` stopped being executable mid-run (`{}` not found) — \
+                 refusing to score this trial",
+                g.name,
+                g.argv.first().map(String::as_str).unwrap_or("?")
+            ));
+        }
         if r.timed_out {
             return Ok(Verdict::Timeout {
                 suite: g.name.clone(),

@@ -38,8 +38,8 @@ fn main() -> ExitCode {
             eprintln!(
                 "crucible — execution-gated corpus forge\n\n\
                  usage:\n\
-                 \x20 crucible forge --repo PATH [--workers N] [--limit N] [--operator OP]\n\
-                 \x20                [--out DIR] [--work DIR]\n\
+                 \x20 crucible forge --repo PATH [--target nedb|nedb-rust] [--workers N]\n\
+                 \x20                [--limit N] [--operator OP] [--out DIR] [--work DIR]\n\
                  \x20 crucible history --repo PATH [--limit N] [--out DIR] [--work DIR]\n\
                  \x20 crucible pairs --repo PATH --trials FILE [--limit N] [--seed N]\n\
                  \x20 crucible locate --repo PATH [--file REL]\n\
@@ -624,7 +624,7 @@ fn cmd_operators() -> Result<(), String> {
 fn cmd_locate(args: &[String]) -> Result<(), String> {
     let repo = flag(args, "--repo").ok_or("--repo is required")?;
     let t = Target::nedb_preset(&repo);
-    let files = locate::discover(&PathBuf::from(&repo), &t.sources, &t.extension);
+    let files = locate::discover(&PathBuf::from(&repo), &t.sources, &t.extension, &t.exclude);
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let only = flag(args, "--file");
     let mut total = 0usize;
@@ -689,7 +689,12 @@ fn cmd_forge(args: &[String]) -> Result<(), String> {
         .display()
         .to_string();
 
-    let t = Target::nedb_preset(&repo);
+    let t = match flag(args, "--target").as_deref() {
+        Some("nedb-rust") => Target::nedb_rust_preset(&repo),
+        // Default stays the Python engine: it is the fast grader and the one
+        // with all ten operators.
+        _ => Target::nedb_preset(&repo),
+    };
     let opts = forge::Opts {
         workers,
         limit,

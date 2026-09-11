@@ -89,6 +89,9 @@ Every one of these came from running the thing, not from reasoning about it.
 - **Harness paths are training-data poison.** Tracebacks from a worktree name a directory that will not exist at inference. They are rewritten to repo-relative.
 - **Harness paths leaked a second time, and I called the corpus clean.** `strip_worktree` removed the work dir but left the per-worker segment, so every row carried `w0/python/nedb/engine.py`. The verification I ran grepped for `/work/` and `crucible` — neither matches a bare leading `w0/` — so an incomplete check reported success on a corpus that was still poisoned. Fixed to consume the work dir *and* the segment after it, with the regression test that would have caught it.
 - **A grader that did not exist yet is not a failing grader.** Running `python3 tests/test_wrap_sqlite_shadow.py` against a commit from before that file was written exits 2, which scored as red — so "this test had not been written" was reported as "the suite cannot grade this era" for 64% of the first history run. That was one bug wearing a plausible explanation.
+- **"Your tests are failing" and "your test command does not exist" are different problems.** A Rust run refused with *"the grader is not green on an unmutated tree"* after exiting in 1 ms. The suite was perfectly green — 71 tests in 0.31 s — and `cargo` simply was not on PATH for that invocation. Exit 127/126 is now classified distinctly and the message names the real cause, because the first message sends you to read the wrong code.
+- **A capped run must sample the repo, not its first file.** `--limit` truncated the job list while workers popped from the end, so the first Rust run spent all five trials inside `src/bin/nedb-cli.rs`. Now round-robin across files. (Same flaw I had already fixed in pair sampling and did not carry back.)
+- **"The crate" and "what the grader runs" are not the same set.** `cargo test --lib` never executes `src/main.rs` or `src/bin/*`, so mutations there are guaranteed survivors — trials that cost 1.6 s each to prove nothing, and a survivor list that reads as a coverage finding when it is really a statement about the grader. Targets now carry an `exclude` list.
 - **`except_swallow` was broader than advertised.** It fired on an `except ImportError:` whose body was fallback *setup* (`import types as _types`), producing a missing-import bug whose own `NameError` names the fix — a copy-paste task mislabelled as silent-failure training. It now fires only where the handler raises, returns, or reports.
 
 ## Two corpus sources
@@ -125,6 +128,28 @@ The reason is structural and should have been predicted: a survivor survives bec
 `--mode killer+survivor` (the default) pairs one proven killer with one proven survivor. Red is guaranteed by the killer, so yield is near-total — **23 of 24, and 23/23 same-scope** on nedb — and the row gains a property no single-site row can have: **the failing output points at one site while two need repairing.** That is the shape of a real fix that treats the visible symptom and leaves a latent defect behind.
 
 Survivor-pair is kept because the 2.5% it finds are genuinely emergent and nothing else produces them. It is simply not the volume play.
+
+## Two languages, one forge
+
+`--target nedb` mutates the Python engine. `--target nedb-rust` mutates the Rust v2/v3 DAG core. Same scheduler, same double gate, same corpus format — only the locator changes.
+
+| | Python (`python/nedb`) | Rust (`rust/nedb-v2/src`) |
+|---|---|---|
+| Source | 8,460 lines / 29 files | 11,269 lines / 31 files |
+| Candidates | **3,646** (4 refused) | **764** (10 refused) |
+| Operators | 10 | 5 (type-preserving only) |
+| Kill rate | 22–39% | **25%** |
+| Per-trial cost | 0.9 s focused · 3 s fallback | **0.4–1.6 s** once warm |
+| Grader | 11 standalone suites | `cargo test -p nedb-engine --lib` (71 tests) |
+| Test code excluded | n/a (tests live outside the package) | **91,776 bytes** of inline `#[cfg(test)]` |
+
+Rust is **cheaper per trial than Python** once a worktree's `target/` is warm — the cold build is 42 s, so a production run should give each worker a persistent `CARGO_TARGET_DIR` and pay that once. I had earlier dismissed the Rust locator as 10–20× too expensive; that was a guess, and measuring it properly took three attempts (the first two edited files outside the crate under test and reported meaningless numbers).
+
+Rust yields fewer candidates despite being the larger surface because it only has the five **type-preserving** operators. That is deliberate: Rust's compiler is part of the grader, so a mutation that fails to typecheck still turns the suite red — but the error names the fix, making the row worthless, exactly like the `SyntaxError` case in Python. The valuable structural operators (`except_swallow`, `guard_drop`, `return_none` equivalents) need more `syn` work and are not written.
+
+### What killed the first Rust locator
+
+It walked a flattened token stream, the way the Python locator's token pass does. Rust's grammar punishes that: `<` and `>` are overloaded for **generics**, so `std::io::Result<Vec<u8>>` produced two `compare_flip` candidates, and flipping a generic's angle bracket is a syntax error rather than a semantic bug. No *local* token rule separates the two — `Vec<u8>` and `a < b` are indistinguishable without knowing you are in a type position. Comparisons now come from `Expr::Binary` nodes, where a generic bracket is simply never an operator. My own test caught it before a single trial ran.
 
 ## Architecture
 

@@ -4,3 +4,5 @@ out/
 Cargo.lock.bak
 __pycache__/
 *.pyc
+locators/rust-locate/target/
+rout/

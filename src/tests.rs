@@ -226,3 +226,37 @@ fn a_grader_env_var_resolves_the_repo_placeholder() {
     assert!(v.contains("{REPO}"), "got {v}");
     assert_eq!(v.replace("{REPO}", "/wt"), "/wt/python");
 }
+
+#[test]
+fn a_missing_grader_is_not_a_failing_grader() {
+    // THE MISDIAGNOSIS THIS PREVENTS. A Rust run reported "the grader is not
+    // green on an unmutated tree" after exiting in 1 ms. The suite was green —
+    // 71 tests, 0.31 s — and `cargo` simply was not on PATH for that
+    // invocation. "Your tests are failing" and "your test command does not
+    // exist" are different problems with different fixes, and the first message
+    // sends you to read the wrong code.
+    let g = crate::target::Grader {
+        name: "ghost".into(),
+        argv: vec!["definitely-not-a-real-binary-xyzzy".into()],
+        env: vec![],
+    };
+    let r = crate::verify::run_grader(std::path::Path::new("."), &g, 3_000)
+        .expect("timeout itself must run");
+    assert!(!r.ok);
+    assert!(
+        r.not_executable,
+        "exit {:?} after {} ms should be classified as not-executable",
+        127, r.elapsed_ms
+    );
+    assert!(!r.timed_out, "a missing binary is not a timeout");
+
+    // And the baseline must refuse with a message that names the real cause.
+    let err =
+        crate::verify::measure_baseline(std::path::Path::new("."), &[&g], 3_000, |_, _, _, _| {})
+            .expect_err("must refuse");
+    assert!(err.contains("not found or is not executable"), "{err}");
+    assert!(
+        !err.contains("is not green on an unmutated tree"),
+        "must NOT blame the target's tests: {err}"
+    );
+}

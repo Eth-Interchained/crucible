@@ -52,10 +52,21 @@ pub fn locate(locator: &[String], cwd: &Path, file: &Path) -> Result<LocateRepor
 /// Skips the obvious non-source: caches, VCS internals, build output, and
 /// anything under a `tests/` path — mutating the grader itself would produce a
 /// tautology (the test changes, so of course it fails).
-pub fn discover(root: &Path, dirs: &[String], ext: &str) -> Vec<std::path::PathBuf> {
+pub fn discover(
+    root: &Path,
+    dirs: &[String],
+    ext: &str,
+    exclude: &[String],
+) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for d in dirs {
         walk(&root.join(d), ext, &mut out);
+    }
+    if !exclude.is_empty() {
+        out.retain(|p| {
+            let s = p.display().to_string();
+            !exclude.iter().any(|e| s.contains(e.as_str()))
+        });
     }
     out.sort();
     out
