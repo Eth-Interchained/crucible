@@ -9,7 +9,9 @@
 //! only what a real suite proved was detectable, and report the rest as a
 //! coverage finding.
 
-use crucible::{eval, flair, forge, history, locate, pairs, render, report, target::Target};
+use crucible::{
+    eval, flair, forge, history, locate, outlock::OutLock, pairs, render, report, target::Target,
+};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
                  usage:\n\
                  \x20 crucible forge --repo PATH [--target nedb|nedb-rust] [--workers N]\n\
                  \x20                [--limit N] [--operator OP] [--out DIR] [--work DIR]\n\
+                 \x20                [--force]\n\
                  \x20 crucible history --repo PATH [--limit N] [--out DIR] [--work DIR]\n\
                  \x20 crucible pairs --repo PATH --trials FILE [--limit N] [--seed N]\n\
                  \x20 crucible eval --repo PATH --corpus FILE [--model oracle|null|cheat]\n\
@@ -725,10 +728,23 @@ fn cmd_eval(args: &[String]) -> Result<(), String> {
     // saying so LOUDLY matters more than exiting zero.
     if responder.name() == "oracle" && solved != n {
         println!();
+        // Every row's own completion is BY CONSTRUCTION a correct repair, so
+        // anything under 100% means something upstream is wrong. What exactly,
+        // this code cannot tell — and the earlier version asserted "this
+        // harness is broken, not the corpus", which was simply false the first
+        // time it fired. The real cause was two forge runs sharing one --out
+        // dir, rewriting corpus.jsonl underneath a running eval. Naming one
+        // speculative cause sent the investigation the wrong way; so now it
+        // names every cause it genuinely cannot distinguish.
         flair::warn(&format!(
-            "THE ORACLE DID NOT SCORE 100% ({solved}/{n}). This harness is broken, not the \
-             corpus — every row's own completion is by construction a correct repair. Do not \
-             trust any eval number until this reads {n}/{n}."
+            "THE ORACLE DID NOT SCORE 100% ({solved}/{n}). Every row's own completion is by \
+             construction a correct repair, so this indicts something upstream — but which, \
+             this run cannot tell. Any of: (a) a harness defect in apply/restore/grade; \
+             (b) rows whose grader is FLAKY, passing confirm-kill on a coin flip and then \
+             grading green here; (c) the corpus file changing under this run, e.g. a \
+             concurrent forge writing the same --out dir. Check BAD-ROW vs MISSED above to \
+             tell them apart: BAD-ROW means the broken state graded green, which is (b) or \
+             (c). Do not trust any eval number until this reads {n}/{n}."
         ));
         return Err("oracle below 100% — harness defect".into());
     }
@@ -838,8 +854,18 @@ fn cmd_forge(args: &[String]) -> Result<(), String> {
         });
     let limit = flag(args, "--limit").and_then(|v| v.parse().ok());
     let only_operator = flag(args, "--operator");
+    let force = args.iter().any(|a| a == "--force");
     let out_dir = PathBuf::from(flag(args, "--out").unwrap_or_else(|| "out".into()));
     let work_dir = PathBuf::from(flag(args, "--work").unwrap_or_else(|| "work".into()));
+    // Claim the output directory EXCLUSIVELY before doing any work.
+    //
+    // Two forge runs were once pointed at the same --out dir. Both happily
+    // wrote corpus.jsonl, so the file changed size and content underneath a
+    // running eval, which then scored 84.2% and blamed the harness. The
+    // corpus is the one artifact this whole project exists to make
+    // trustworthy; a corpus that mutates while it is being read is worse than
+    // no corpus, and worse still because nothing reported it.
+    let _out_lock = OutLock::claim(&out_dir, force)?;
     // Absolutised here as well as in Worktree::create, so the path printed in
     // the banner is the path git will actually use.
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work dir: {e}"))?;
