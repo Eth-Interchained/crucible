@@ -54,3 +54,50 @@ jobs:
               compile(spliced, "x.py", "exec")
           print(f"{len(d['candidates'])} candidates, all spans exact and all splices compile")
           PY
+
+  # The Rust locator is its own crate with its own tests, and nine of them guard
+  # things that fail SILENTLY: spans that are all 0..0 when the `span-locations`
+  # feature is off, generics mistaken for comparisons, test modules leaking into
+  # the candidate set. Without this job none of them would ever run in CI.
+  rust-locator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: locators/rust-locate
+      - name: fmt
+        working-directory: locators/rust-locate
+        run: cargo fmt --all -- --check
+      - name: clippy
+        working-directory: locators/rust-locate
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        working-directory: locators/rust-locate
+        run: cargo test
+      - name: round-trip every candidate against real Rust source
+        working-directory: locators/rust-locate
+        run: |
+          set -euo pipefail
+          cargo build --release
+          # Point it at its own source: a real file, in this repo, with generics,
+          # string literals, integer suffixes and an inline #[cfg(test)] module —
+          # which is exactly the shape that broke the first implementation.
+          ./target/release/rust-locate src/main.rs > /tmp/rl.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/rl.json"))
+          assert d.get("error") is None, d["error"]
+          assert len(d["candidates"]) > 5, f"suspiciously few: {len(d['candidates'])}"
+          src = open("src/main.rs", "rb").read()
+          for c in d["candidates"]:
+              got = src[c["start_byte"]:c["end_byte"]].decode()
+              assert got == c["before"], (c["operator"], c["line"], got, c["before"])
+              assert c["end_byte"] > 0, "span-locations feature is off"
+          assert d["excluded_test_bytes"] > 0, "its own #[cfg(test)] module was not excluded"
+          print(f"{len(d['candidates'])} candidates, all spans exact, "
+                f"{d['excluded_test_bytes']} test bytes excluded")
+          PY
