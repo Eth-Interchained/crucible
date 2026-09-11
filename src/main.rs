@@ -43,7 +43,9 @@ fn main() -> ExitCode {
                  \x20                [--limit N] [--operator OP] [--out DIR] [--work DIR]\n\
                  \x20 crucible history --repo PATH [--limit N] [--out DIR] [--work DIR]\n\
                  \x20 crucible pairs --repo PATH --trials FILE [--limit N] [--seed N]\n\
-                 \x20 crucible eval --repo PATH --corpus FILE [--model oracle|null|cheat]\n\
+                 \x20 crucible eval --repo PATH --corpus FILE [--model oracle|null|cheat|teacher]\n\
+                 \x20                [--teacher-model NAME] [--endpoint URL]\n\
+                 \x20                [--teacher-max-tokens N] [--transcript FILE]\n\
                  \x20 crucible locate --repo PATH [--file REL]\n\
                  \x20 crucible operators\n"
             );
@@ -618,6 +620,54 @@ fn cmd_eval(args: &[String]) -> Result<(), String> {
             // The suite most rows are graded by, so the cheat is plausible.
             test_path: "tests/test_nedb.py".into(),
         }),
+        // The point of the whole factory: a real teacher model, whose
+        // answers are only kept when the suite actually goes green.
+        Some("teacher") => {
+            let endpoint = flag(args, "--endpoint")
+                .or_else(|| std::env::var("CRUCIBLE_TEACHER_ENDPOINT").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+            let model = flag(args, "--teacher-model")
+                .or_else(|| std::env::var("CRUCIBLE_TEACHER_MODEL").ok())
+                .ok_or(
+                    "--teacher-model NAME is required with --model teacher (e.g. glm-5.3-flash)",
+                )?;
+            let mut t = crucible::teacher::Teacher::new(&endpoint, &model);
+            if let Some(v) = flag(args, "--teacher-max-tokens").and_then(|v| v.parse().ok()) {
+                t.max_tokens = v;
+            }
+            if let Some(v) = flag(args, "--teacher-timeout").and_then(|v| v.parse().ok()) {
+                t.timeout_secs = v;
+            }
+            // Never read from a flag: a key in argv is a key in every ps
+            // listing and shell history on the box.
+            t.api_key = std::env::var("CRUCIBLE_TEACHER_KEY").ok();
+            // Default the transcript ON, next to the corpus. The reasoning
+            // traces are the expensive product of a teacher run, and a
+            // scoreboard that reports a percentage while discarding the bytes
+            // that earned it means paying for the same tokens twice.
+            t.transcript = Some(
+                flag(args, "--transcript")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(&corpus_path)
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .join("teacher.jsonl")
+                    }),
+            );
+            eprintln!(
+                "{}",
+                flair::dim(&format!(
+                    "  teacher {model} at {endpoint} · max_tokens {} · transcript {}",
+                    t.max_tokens,
+                    t.transcript
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ))
+            );
+            Box::new(t)
+        }
         // Default is the oracle, deliberately: the first thing anyone runs
         // should be the thing that validates the harness.
         _ => Box::new(eval::Oracle),
