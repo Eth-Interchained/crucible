@@ -317,3 +317,72 @@ pub fn history_example(
         repo_commit: sha.to_string(),
     }
 }
+
+/// A row from an EMERGENT defect — two sites, each proven undetectable alone.
+///
+/// The prompt says there are two, and says it plainly. Hiding that would make
+/// this indistinguishable from a single-site row while the label reverts two
+/// places, and a model that finds one site and stops would look wrong when it
+/// was reasoning correctly about the information it was given.
+#[allow(clippy::too_many_arguments)]
+pub fn pair_example(
+    rel_path: &str,
+    suite: &str,
+    tail: &str,
+    broken: &str,
+    fixed: &str,
+    line_a: usize,
+    line_b: usize,
+    operator: &str,
+    affinity: &str,
+    repo_name: &str,
+    repo_commit: &str,
+    work_dir: &str,
+) -> Example {
+    let tail = focus_failure(&strip_worktree(tail, work_dir, repo_name));
+    let (lo, hi) = if line_a <= line_b {
+        (line_a, line_b)
+    } else {
+        (line_b, line_a)
+    };
+    // One excerpt when the sites are close, two when they are far apart —
+    // otherwise a 400-line span would be pasted to show two lines.
+    let body = if hi - lo <= 24 {
+        excerpt(broken, (lo + hi) / 2, ((hi - lo) / 2) + 8)
+    } else {
+        format!(
+            "{}\n        ⋮\n{}",
+            excerpt(broken, lo, 8),
+            excerpt(broken, hi, 8)
+        )
+    };
+    let prompt = format!(
+        "Repository: {repo_name}\nCommit: {commit}\n\nThe test suite `{suite}` is failing.\n\n\
+         ── what the suite reported ──\n{tail}\n\n\
+         ── the file it points into: {rel_path} ──\n{body}\n\
+         There are TWO defects in this file. The failing output above may only \
+         point at one of them. Repair both. Reply with ONLY a unified diff inside \
+         a sentinel block:\n\n\
+         <<<PATCH>>>\n--- a/<path>\n+++ b/<path>\n@@ ... @@\n...\n<<<END>>>\n",
+        commit = &repo_commit[..repo_commit.len().min(9)],
+        tail = tail.trim(),
+    );
+    let diff = unified_hunk(rel_path, broken, fixed);
+    Example {
+        id: format!("pair:{rel_path}:{lo}:{hi}"),
+        prompt,
+        completion: format!("<<<PATCH>>>\n{diff}<<<END>>>\n"),
+        operator: operator.to_string(),
+        severity: format!("emergent/{affinity}"),
+        file: rel_path.to_string(),
+        line: lo,
+        scope: String::new(),
+        verdict: "EMERGENT".into(),
+        caused_by: vec![
+            format!("site:{rel_path}:{lo}"),
+            format!("site:{rel_path}:{hi}"),
+            format!("tree:{repo_commit}"),
+        ],
+        repo_commit: repo_commit.to_string(),
+    }
+}

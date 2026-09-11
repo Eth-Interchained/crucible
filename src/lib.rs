@@ -37,6 +37,7 @@ pub mod forge;
 pub mod history;
 pub mod locate;
 pub mod model;
+pub mod pairs;
 pub mod render;
 pub mod report;
 pub mod target;

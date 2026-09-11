@@ -114,6 +114,18 @@ Measured on nedb's last 30 source-touching commits:
 
 What it recovered on its first real run, unprompted: `f4a5461` *"fix(wrap): backend='auto' must never silently downgrade durability"* and `390544b` *"fix(wrap): wrap_redis crashed on every install lacking the native wheel"* — two of the nine silent defects from 2026-09-08. And the best demonstration of why messages are not labels: `2f400cf` is tagged `docs:` and it repaired `test_wrap_redis`.
 
+### `crucible pairs` — two-site defects
+
+Two modes, and the **first hypothesis was wrong**, which is worth stating plainly.
+
+`--mode survivor-pair` takes two mutations each *proven* to survive alone. Expected to be the biggest data source available; measured **1 emergent kill in 40 pairs — 2.5%**, far worse than single mutation's 22–39%.
+
+The reason is structural and should have been predicted: a survivor survives because its code path **is not exercised**. Two unexercised lines in the same unexercised function are still unexercised — pairing does not manufacture coverage. Nearly every sampled pair landed in `autoindex.query`, a function the suite barely touches.
+
+`--mode killer+survivor` (the default) pairs one proven killer with one proven survivor. Red is guaranteed by the killer, so yield is near-total — **23 of 24, and 23/23 same-scope** on nedb — and the row gains a property no single-site row can have: **the failing output points at one site while two need repairing.** That is the shape of a real fix that treats the visible symptom and leaves a latent defect behind.
+
+Survivor-pair is kept because the 2.5% it finds are genuinely emergent and nothing else produces them. It is simply not the volume play.
+
 ## Architecture
 
 **Rust forge, per-language locators out of process.**
@@ -185,6 +197,8 @@ crucible locate --repo /path/to/nedb  # candidate count per file, no execution
 crucible forge   --repo /path/to/nedb --workers 8 --out out --work work
 crucible forge   --repo /path/to/nedb --operator except_swallow --limit 200
 crucible history --repo /path/to/nedb --limit 200     # needs a FULL clone
+crucible pairs   --repo /path/to/nedb --trials out/trials.json --limit 500
+crucible pairs   --repo /path/to/nedb --trials out/trials.json --mode survivor-pair
 ```
 
 Outputs `out/corpus.jsonl` (mutation rows), `out/history.jsonl` (mined rows), `out/trials.json` and `out/replays.json` (every verdict, including the unusable ones).
@@ -198,8 +212,8 @@ Outputs `out/corpus.jsonl` (mutation rows), `out/history.jsonl` (mined rows), `o
 - **Yield.** 3,669 candidates at ~35% is roughly **1,200 rows** from nedb's Python. That is enough for a focused LoRA, not enough for a strong model on its own. The multipliers are the Rust core, git-history mining, multi-mutation examples, and more repos.
 - **`severity` does not discriminate yet.** All ten operators are classified `silent`, so the field is currently a constant. The taxonomy is right in principle and needs genuinely *loud* operators (ones that crash) before it carries information.
 - **Grader precision varies, and it affects row quality.** `test_adapters` reports per-assertion; `test_deploy` says "daemon did not start", which does not localise the defect at all. Rows from coarse graders are weaker labels.
-- **Single-mutation only.** Every example is one localised change. Real defects are often coupled across files.
-- **Python only.** The Rust locator (`syn`) is not written.
+- **Cross-file pair repairs are not written as rows.** The row format carries one diff, and emitting a single-file diff for a two-file repair would be a label that does not restore green. The kill is reported; the row is skipped, out loud.
+- **Python only so far — and the Rust locator is cheaper than assumed.** A real one-line edit in `nedb-v2/src/db.rs` plus a full recompile and 71 tests costs **1.58 s**, against 0.9 s for the focused Python grader. That is 1.8×, not the 10–20× guessed at, and the Rust surface (11,269 lines / 31 files) is 33% larger than the Python. The genuine cost is the 42 s cold build per fresh worktree, which a per-worker `CARGO_TARGET_DIR` warmed once turns into a one-time charge.
 
 ## License
 

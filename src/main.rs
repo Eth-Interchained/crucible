@@ -9,7 +9,7 @@
 //! only what a real suite proved was detectable, and report the rest as a
 //! coverage finding.
 
-use crucible::{flair, forge, history, locate, render, report, target::Target};
+use crucible::{flair, forge, history, locate, pairs, render, report, target::Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         Some("forge") => cmd_forge(&args[1..]),
         Some("locate") => cmd_locate(&args[1..]),
         Some("history") => cmd_history(&args[1..]),
+        Some("pairs") => cmd_pairs(&args[1..]),
         Some("operators") => cmd_operators(),
         _ => {
             eprintln!(
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
                  \x20 crucible forge --repo PATH [--workers N] [--limit N] [--operator OP]\n\
                  \x20                [--out DIR] [--work DIR]\n\
                  \x20 crucible history --repo PATH [--limit N] [--out DIR] [--work DIR]\n\
+                 \x20 crucible pairs --repo PATH --trials FILE [--limit N] [--seed N]\n\
                  \x20 crucible locate --repo PATH [--file REL]\n\
                  \x20 crucible operators\n"
             );
@@ -267,6 +269,305 @@ fn cmd_history(args: &[String]) -> Result<(), String> {
             out_dir.display(),
             out_dir.display()
         ))
+    );
+    Ok(())
+}
+
+/// `crucible pairs` — mine EMERGENT defects out of the survivors.
+///
+/// Two mutations that each survive alone but kill together are a defect neither
+/// site is individually blameable for. Single-mutation corpora cannot produce
+/// that class, and it is the class real bugs live in. It also turns the ~65% of
+/// every forge run that was previously discarded into the largest data source
+/// available.
+fn cmd_pairs(args: &[String]) -> Result<(), String> {
+    let repo = flag(args, "--repo").ok_or("--repo is required")?;
+    let repo = PathBuf::from(&repo)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize --repo {repo}: {e}"))?;
+    let trials_path = flag(args, "--trials").ok_or(
+        "--trials FILE is required — run `crucible forge` first; its trials.json is the feedstock",
+    )?;
+    let limit: usize = flag(args, "--limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let seed: u64 = flag(args, "--seed")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let cross: usize = flag(args, "--cross-file-pct")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let out_dir = PathBuf::from(flag(args, "--out").unwrap_or_else(|| "out".into()));
+    let work_dir = PathBuf::from(flag(args, "--work").unwrap_or_else(|| "work".into()));
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+    let work_dir = work_dir.canonicalize().map_err(|e| e.to_string())?;
+
+    let raw =
+        std::fs::read_to_string(&trials_path).map_err(|e| format!("read {trials_path}: {e}"))?;
+    let trials: Vec<crucible::model::Trial> =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {trials_path}: {e}"))?;
+    let surv = pairs::survivors(&trials).len();
+    let mode = match flag(args, "--mode").as_deref() {
+        Some("survivor-pair") => pairs::Mode::SurvivorPair,
+        // Default to the mode the measurement favours. Survivor-pair yielded
+        // 2.5% on nedb; killer+survivor is red by construction.
+        _ => pairs::Mode::KillerPlusSurvivor,
+    };
+    let picked = pairs::sample(&trials, limit, seed, cross, mode);
+
+    let t = Target::nedb_preset(&repo.display().to_string());
+    let head = crucible::worktree::head_commit(&repo)?;
+    flair::banner(&t.name, &head, trials.len(), t.graders.len(), 1);
+    flair::phase(
+        "PAIRS",
+        &format!(
+            "{} mode · {surv} survivors + {} killers in {} trials · {} pairs (seed {seed})",
+            if mode == pairs::Mode::SurvivorPair {
+                "survivor-pair"
+            } else {
+                "killer+survivor"
+            },
+            pairs::killers(&trials).len(),
+            trials.len(),
+            picked.len()
+        ),
+    );
+    if picked.is_empty() {
+        return Err(format!(
+            "no pairs could be sampled from {surv} survivors — run a wider forge first"
+        ));
+    }
+    match mode {
+        pairs::Mode::SurvivorPair => flair::note(
+            "both sites ALREADY survived alone, proven by execution — a kill below is \
+             emergent: neither line is individually blameable.",
+        ),
+        pairs::Mode::KillerPlusSurvivor => flair::note(
+            "one site is a proven killer, the other a proven survivor — the failing \
+             output will point at ONE site while TWO need repairing.",
+        ),
+    }
+
+    flair::phase(
+        "BASELINE",
+        "the grader must be green before anything is broken",
+    );
+    let probe = crucible::worktree::Worktree::create(&repo, &work_dir, "pbase", &head)?;
+    let all = t.all_graders();
+    let base = crucible::verify::measure_baseline(&probe.root, &all, 120_000, |n, ms, d, ok| {
+        flair::baseline(n, ms, d, ok);
+    })?;
+    drop(probe);
+
+    flair::phase("FORGE", "two undetectable changes at once");
+    let wt = crucible::worktree::Worktree::create(&repo, &work_dir, "pairs", &head)?;
+    let started = std::time::Instant::now();
+    let mut killed = 0usize;
+    let mut rows = 0usize;
+    let mut by_aff: std::collections::BTreeMap<&str, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    use std::io::Write;
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let mut fh = std::fs::File::create(out_dir.join("pairs.jsonl")).map_err(|e| e.to_string())?;
+
+    for (i, p) in picked.iter().enumerate() {
+        let same_file = p.a_file == p.b_file;
+        let a_abs = wt.root.join(&p.a_file);
+        let b_abs = wt.root.join(&p.b_file);
+        let a_orig = std::fs::read(&a_abs).map_err(|e| format!("read {}: {e}", p.a_file))?;
+        let b_orig = if same_file {
+            a_orig.clone()
+        } else {
+            std::fs::read(&b_abs).map_err(|e| format!("read {}: {e}", p.b_file))?
+        };
+
+        let write_res = if same_file {
+            match pairs::apply_same_file(&a_orig, &p.a, &p.b) {
+                Ok(m) => std::fs::write(&a_abs, &m).map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            }
+        } else {
+            pairs::apply_one(&a_orig, &p.a)
+                .and_then(|m| std::fs::write(&a_abs, &m).map_err(|e| e.to_string()))
+                .and_then(|_| pairs::apply_one(&b_orig, &p.b))
+                .and_then(|m| std::fs::write(&b_abs, &m).map_err(|e| e.to_string()))
+        };
+        if let Err(e) = write_res {
+            // Overlapping sites and off-the-end sites land here. Named, never
+            // a silent skip.
+            flair::abort(&p.a_file, &p.a.operator, p.a.line, &e);
+            let _ = wt.restore(std::path::Path::new(&p.a_file));
+            if !same_file {
+                let _ = wt.restore(std::path::Path::new(&p.b_file));
+            }
+            continue;
+        }
+
+        // Grade with the union of both sites' focused graders.
+        let mut names: Vec<String> = Vec::new();
+        for f in [&p.a_file, &p.b_file] {
+            for g in t.graders_for(f) {
+                if !names.contains(&g.name) {
+                    names.push(g.name.clone());
+                }
+            }
+        }
+        let graders: Vec<&crucible::target::Grader> = names
+            .iter()
+            .filter_map(|n| t.graders.iter().find(|g| &g.name == n))
+            .collect();
+
+        let t0 = std::time::Instant::now();
+        let verdict = crucible::verify::grade(&wt.root, &graders, &base);
+        let ms = t0.elapsed().as_millis() as u64;
+        let _ = wt.restore(std::path::Path::new(&p.a_file));
+        if !same_file {
+            let _ = wt.restore(std::path::Path::new(&p.b_file));
+        }
+        let verdict = verdict?;
+
+        let e = by_aff.entry(p.affinity.label()).or_insert((0, 0));
+        e.1 += 1;
+        if verdict.killed() {
+            e.0 += 1;
+            killed += 1;
+        }
+
+        flair::trial(
+            i + 1,
+            picked.len(),
+            verdict.label(),
+            &format!("{}+{}", p.a.operator, p.b.operator),
+            // This slot is a SEVERITY, and an affinity is not one — passing
+            // `same-scope` here made every pair render as "loud", because
+            // flair::trial only recognises "silent". A two-site defect is
+            // silent if either of its sites is. The affinity is already in the
+            // per-affinity table below, where it belongs.
+            if p.a.severity == "silent" || p.b.severity == "silent" {
+                "silent"
+            } else {
+                "loud"
+            },
+            &p.a_file,
+            p.a.line,
+            &p.a.scope,
+            ms,
+            &match &verdict {
+                crucible::model::Verdict::Failed { suite, .. } => {
+                    format!("two-site — caught by {suite}")
+                }
+                crucible::model::Verdict::Timeout { suite, .. } => format!("{suite} hung"),
+                crucible::model::Verdict::Survived => {
+                    format!("both still invisible (L{})", p.b.line)
+                }
+            },
+        );
+
+        if let crucible::model::Verdict::Failed { suite, tail } = &verdict {
+            // Row: the broken side has BOTH sites applied; the repair restores
+            // both. Only emitted for same-file pairs for now — a cross-file
+            // repair needs a multi-file diff, which the row format does not yet
+            // carry, and emitting a single-file diff for it would be a LABEL
+            // THAT DOES NOT RESTORE GREEN. Said out loud rather than shipped.
+            if same_file {
+                let pristine = String::from_utf8_lossy(&a_orig).to_string();
+                let broken = String::from_utf8_lossy(&pairs::apply_same_file(&a_orig, &p.a, &p.b)?)
+                    .to_string();
+                let ex = render::pair_example(
+                    &p.a_file,
+                    suite,
+                    tail,
+                    &broken,
+                    &pristine,
+                    p.a.line,
+                    p.b.line,
+                    &format!("{}+{}", p.a.operator, p.b.operator),
+                    p.affinity.label(),
+                    &t.name,
+                    &head,
+                    &work_dir.display().to_string(),
+                );
+                writeln!(
+                    fh,
+                    "{}",
+                    serde_json::to_string(&ex).map_err(|e| e.to_string())?
+                )
+                .map_err(|e| e.to_string())?;
+                rows += 1;
+            } else {
+                flair::note(
+                    "cross-file kill not written as a row: the repair spans two files and \
+                     the row format carries one diff",
+                );
+            }
+        }
+    }
+    let _ = wt.checkout(&head);
+    drop(wt);
+
+    // THE LABEL MUST MATCH THE MODE. An earlier version printed "EMERGENT —
+    // neither site detectable alone" for BOTH modes, which is false for
+    // killer+survivor: there, one site is detectable alone, and that is the
+    // entire point of the mode. An assay that describes the wrong experiment is
+    // worse than no assay, because it is quotable. Third time tonight a label
+    // contradicted what the code actually did.
+    let (headline, meaning) = match mode {
+        pairs::Mode::SurvivorPair => (
+            "EMERGENT kills",
+            "neither site was detectable alone — the interaction IS the defect",
+        ),
+        pairs::Mode::KillerPlusSurvivor => (
+            "two-site kills",
+            "red by construction (one site is a proven killer); the value is that the \
+             failing output names ONE site while TWO need repairing",
+        ),
+    };
+    flair::phase(
+        "ASSAY",
+        match mode {
+            pairs::Mode::SurvivorPair => "defects that exist only in combination",
+            pairs::Mode::KillerPlusSurvivor => "a visible symptom sitting over a latent defect",
+        },
+    );
+    println!(
+        "  {:<26} {}  {}",
+        "pairs graded",
+        flair::bold(&picked.len().to_string()),
+        flair::dim(&format!("from {surv} survivors"))
+    );
+    println!(
+        "  {:<26} {}  {}",
+        headline,
+        flair::green(&killed.to_string()),
+        flair::dim(&format!(
+            "{:.1}% — {meaning}",
+            killed as f64 * 100.0 / picked.len().max(1) as f64
+        ))
+    );
+    println!(
+        "  {:<26} {}",
+        "rows written",
+        flair::bold(&rows.to_string())
+    );
+    println!(
+        "  {:<26} {}",
+        "wall clock",
+        flair::dim(&format!("{:.1}s", started.elapsed().as_secs_f64()))
+    );
+    println!("\n  {}", flair::bold("kill rate by affinity"));
+    for (aff, (k, n)) in &by_aff {
+        println!(
+            "  {:<18} {:>3}/{:<3} {:>5.1}%",
+            flair::blue(aff),
+            k,
+            n,
+            *k as f64 * 100.0 / *n as f64
+        );
+    }
+    println!(
+        "\n  {} {}",
+        flair::ember("▸"),
+        flair::dim(&format!("rows: {}/pairs.jsonl", out_dir.display()))
     );
     Ok(())
 }
