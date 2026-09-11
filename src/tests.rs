@@ -104,10 +104,50 @@ fn the_deploy_suites_bare_fail_is_recognised() {
 fn harness_paths_never_reach_a_prompt() {
     // Training-data poison: the grader runs in a throwaway worktree, so
     // tracebacks name a directory that will not exist at inference time.
+    //
+    // The second argument is the WORK DIR — the parent of the per-worker trees,
+    // which is what the call sites have. An earlier version of this test passed
+    // the worktree root itself, which is why the worker-segment leak below went
+    // unnoticed: the test agreed with the bug.
     let tail = "File \"/tmp/crucible/work/w3/python/nedb/engine.py\", line 44, in put";
-    let s = strip_worktree(tail, "/tmp/crucible/work/w3", "nedb");
+    let s = strip_worktree(tail, "/tmp/crucible/work", "nedb");
     assert!(!s.contains("/tmp/crucible"), "{s}");
+    assert!(!s.contains("w3/"), "{s}");
     assert!(s.contains("python/nedb/engine.py"), "{s}");
+}
+
+#[test]
+fn the_worker_directory_name_is_stripped_too() {
+    // THE TEST THAT WOULD HAVE CAUGHT ME. `strip_worktree` originally removed
+    // only the work dir, leaving the per-worker segment as a path prefix, and
+    // the verification I ran grepped for "/work/" and "crucible" — neither of
+    // which matches a bare leading "w0/". I reported the corpus clean while
+    // every row still carried a harness path.
+    for worker in ["w0", "w11", "history", "baseline"] {
+        let tail = format!(
+            "File \"/agent/work/{worker}/python/nedb/engine.py\", line 44, in put\n  \
+             File \"/agent/work/{worker}/tests/test_nedb.py\", line 9, in <module>"
+        );
+        let s = strip_worktree(&tail, "/agent/work", "nedb");
+        assert!(
+            s.contains("python/nedb/engine.py") && s.contains("tests/test_nedb.py"),
+            "paths must survive, got: {s}"
+        );
+        assert!(
+            !s.contains(&format!("{worker}/")),
+            "worker segment `{worker}/` survived: {s}"
+        );
+        assert!(!s.contains("/agent/work"), "work dir survived: {s}");
+    }
+}
+
+#[test]
+fn a_trailing_slash_on_the_work_dir_changes_nothing() {
+    let tail = "at /w/w0/python/nedb/log.py:12";
+    assert_eq!(
+        strip_worktree(tail, "/w", "nedb"),
+        strip_worktree(tail, "/w/", "nedb")
+    );
 }
 
 #[test]

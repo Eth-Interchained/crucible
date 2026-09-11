@@ -171,10 +171,31 @@ pub fn focus_failure(output: &str) -> String {
 /// that will not exist at inference time and has nothing to do with the repo.
 /// A model trained on those learns the harness instead of the codebase. Found
 /// by reading the first real corpus row rather than by reasoning about it.
-pub fn strip_worktree(tail: &str, worktree_root: &str, repo_name: &str) -> String {
-    let mut out = tail.replace(&format!("{worktree_root}/"), "");
-    out = out.replace(worktree_root, repo_name);
-    out
+pub fn strip_worktree(tail: &str, work_dir: &str, repo_name: &str) -> String {
+    // `work_dir` is the PARENT of the per-worker trees, so stripping it alone
+    // leaves the worker's own directory name behind as a path prefix:
+    // `/…/work/w0/python/nedb/engine.py` became `w0/python/nedb/engine.py`.
+    //
+    // I SHIPPED THAT AND CALLED IT CLEAN. The check I ran grepped for `/work/`
+    // and for `crucible`, and a bare leading `w0/` matches neither — so an
+    // incomplete verification reported success on a corpus that still carried
+    // harness paths in every row. The fix consumes the work dir AND the segment
+    // after it; the test below is the one that would have caught me.
+    let mut out = String::with_capacity(tail.len());
+    let mut rest = tail;
+    let needle = format!("{}/", work_dir.trim_end_matches('/'));
+    while let Some(i) = rest.find(needle.as_str()) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + needle.len()..];
+        // Drop the worker segment too (w0, w1, history, baseline, …).
+        rest = match after.find('/') {
+            Some(j) => &after[j + 1..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    // Any bare mention of the work dir with no trailing path becomes the repo.
+    out.replace(work_dir.trim_end_matches('/'), repo_name)
 }
 
 fn describe(v: &Verdict) -> (String, String) {
@@ -247,4 +268,52 @@ pub fn example(
         caused_by: vec![format!("trial:{}", trial.id), format!("tree:{repo_commit}")],
         repo_commit: repo_commit.to_string(),
     })
+}
+
+/// A training row from a REAL fix in git history.
+///
+/// Same shape as the mutation rows on purpose — a trainer should not be able to
+/// tell them apart from the format, only from `source`. The difference that
+/// matters is upstream: this defect was shipped by a human and repaired by a
+/// human, so the diff can span several lines and several hunks, where a
+/// mutation repair is always one splice.
+#[allow(clippy::too_many_arguments)]
+pub fn history_example(
+    sha: &str,
+    parent: &str,
+    suite: &str,
+    tail: &str,
+    rel_path: &str,
+    broken: &str,
+    fixed: &str,
+    line: usize,
+    repo_name: &str,
+    worktree_root: &str,
+) -> Example {
+    let tail = focus_failure(&strip_worktree(tail, worktree_root, repo_name));
+    let prompt = format!(
+        "Repository: {repo_name}\nCommit: {parent_short}\n\nThe test suite `{suite}` is failing.\n\n\
+         ── what the suite reported ──\n{tail}\n\n\
+         ── the file it points into: {rel_path} ──\n{excerpt}\n\
+         Find the defect and repair it. Reply with ONLY a unified diff inside a \
+         sentinel block:\n\n<<<PATCH>>>\n--- a/<path>\n+++ b/<path>\n@@ ... @@\n...\n<<<END>>>\n",
+        parent_short = &parent[..parent.len().min(9)],
+        tail = tail.trim(),
+        excerpt = excerpt(broken, line, 14),
+    );
+    let diff = unified_hunk(rel_path, broken, fixed);
+    Example {
+        id: format!("hist:{}:{}", &sha[..sha.len().min(12)], rel_path),
+        prompt,
+        completion: format!("<<<PATCH>>>\n{diff}<<<END>>>\n"),
+        operator: "history".into(),
+        severity: "real".into(),
+        file: rel_path.to_string(),
+        line,
+        scope: String::new(),
+        verdict: "FIXED".into(),
+        // The ancestry of a mined row is the commit pair itself.
+        caused_by: vec![format!("commit:{sha}"), format!("parent:{parent}")],
+        repo_commit: sha.to_string(),
+    }
 }

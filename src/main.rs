@@ -9,7 +9,7 @@
 //! only what a real suite proved was detectable, and report the rest as a
 //! coverage finding.
 
-use crucible::{flair, forge, locate, render, report, target::Target};
+use crucible::{flair, forge, history, locate, render, report, target::Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -31,6 +31,7 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("forge") => cmd_forge(&args[1..]),
         Some("locate") => cmd_locate(&args[1..]),
+        Some("history") => cmd_history(&args[1..]),
         Some("operators") => cmd_operators(),
         _ => {
             eprintln!(
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
                  usage:\n\
                  \x20 crucible forge --repo PATH [--workers N] [--limit N] [--operator OP]\n\
                  \x20                [--out DIR] [--work DIR]\n\
+                 \x20 crucible history --repo PATH [--limit N] [--out DIR] [--work DIR]\n\
                  \x20 crucible locate --repo PATH [--file REL]\n\
                  \x20 crucible operators\n"
             );
@@ -51,6 +53,222 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `crucible history` — mine VERIFIED fixes out of git history.
+///
+/// A commit is a bug fix if the suite says so: red at the parent, green at the
+/// commit. No commit-message heuristics — "fix:" in a subject is a claim, a
+/// suite going red-to-green is a verdict.
+fn cmd_history(args: &[String]) -> Result<(), String> {
+    let repo = flag(args, "--repo").ok_or("--repo is required")?;
+    let repo = PathBuf::from(&repo)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize --repo {repo}: {e}"))?;
+    let limit: usize = flag(args, "--limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    let out_dir = PathBuf::from(flag(args, "--out").unwrap_or_else(|| "out".into()));
+    let work_dir = PathBuf::from(flag(args, "--work").unwrap_or_else(|| "work".into()));
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+    let work_dir = work_dir.canonicalize().map_err(|e| e.to_string())?;
+
+    let t = Target::nedb_preset(&repo.display().to_string());
+    let head = crucible::worktree::head_commit(&repo)?;
+    let cands = history::candidates(&repo, &t.sources, &t.extension, limit)?;
+
+    flair::banner(&t.name, &head, cands.len(), t.graders.len(), 1);
+    flair::phase(
+        "HISTORY",
+        &format!(
+            "{} non-merge commits touching {}/*.{} · newest first",
+            cands.len(),
+            t.sources.join(","),
+            t.extension
+        ),
+    );
+    if cands.is_empty() {
+        return Err("no candidate commits — check --repo and that history is not shallow".into());
+    }
+
+    // The baseline is measured at HEAD, where the suite is known good, and its
+    // deadlines are reused for every historical replay. Measuring per-commit
+    // would let a commit whose suite is legitimately slow set its own generous
+    // deadline and then never be called hung.
+    flair::phase(
+        "BASELINE",
+        "measured at HEAD; deadlines reused for every replay",
+    );
+    let probe = crucible::worktree::Worktree::create(&repo, &work_dir, "hbase", &head)?;
+    let all = t.all_graders();
+    let base = crucible::verify::measure_baseline(&probe.root, &all, 120_000, |n, ms, d, ok| {
+        flair::baseline(n, ms, d, ok);
+    })?;
+    drop(probe);
+
+    flair::phase(
+        "REPLAY",
+        "parent red + commit green = a fix nobody had to label",
+    );
+    let wt = crucible::worktree::Worktree::create(&repo, &work_dir, "history", &head)?;
+    let started = std::time::Instant::now();
+    let mut replays: Vec<history::Replay> = Vec::new();
+    for (i, c) in cands.iter().enumerate() {
+        let (outcome, ms) = history::replay(&wt, &t, &base, c)?;
+        let tag = match &outcome {
+            history::Outcome::Fixed { suite, .. } => format!("repaired {suite}"),
+            history::Outcome::GreenParent => "suite was already green".into(),
+            history::Outcome::StillRed { suite } => {
+                format!("{suite} red before and after — suite cannot grade this era")
+            }
+            history::Outcome::NotYetWritten { suites } => {
+                format!("{} did not exist yet at this commit", suites.join(","))
+            }
+            history::Outcome::Unrunnable { why } => why.clone(),
+        };
+        flair::trial(
+            i + 1,
+            cands.len(),
+            match outcome.label() {
+                "FIXED" => "FAILED",
+                "UNRUNNABLE" => "ABORT",
+                _ => "SURVIVED",
+            },
+            &c.sha[..9],
+            if outcome.usable() { "silent" } else { "loud" },
+            &c.touched.first().cloned().unwrap_or_default(),
+            c.touched.len(),
+            &c.subject.chars().take(38).collect::<String>(),
+            ms,
+            &tag,
+        );
+        replays.push(history::Replay {
+            commit: c.clone(),
+            outcome,
+            elapsed_ms: ms,
+        });
+    }
+    // Leave the worktree back at HEAD so a later `git worktree list` is boring.
+    let _ = wt.checkout(&head);
+    drop(wt);
+
+    let assay = history::HistoryAssay {
+        replays,
+        wall_ms: started.elapsed().as_millis() as u64,
+    };
+
+    // ---- rows -------------------------------------------------------------
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let mut rows = 0usize;
+    {
+        use std::io::Write;
+        let mut fh =
+            std::fs::File::create(out_dir.join("history.jsonl")).map_err(|e| e.to_string())?;
+        for r in &assay.replays {
+            let history::Outcome::Fixed { suite, tail } = &r.outcome else {
+                continue;
+            };
+            for path in &r.commit.touched {
+                let broken = match history::file_at(&repo, &r.commit.parent, path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // A file ADDED by this commit has no parent version:
+                        // there is no "before" to repair, so it is not a row.
+                        // Said out loud rather than skipped in silence.
+                        flair::note(&format!(
+                            "{}: no parent version of {path} ({e})",
+                            &r.commit.sha[..9]
+                        ));
+                        continue;
+                    }
+                };
+                let fixed = match history::file_at(&repo, &r.commit.sha, path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        flair::note(&format!(
+                            "{}: {path} not readable at commit ({e})",
+                            &r.commit.sha[..9]
+                        ));
+                        continue;
+                    }
+                };
+                if broken == fixed {
+                    continue;
+                }
+                let line = history::touched_line(&repo, &r.commit.sha, path);
+                let ex = render::history_example(
+                    &r.commit.sha,
+                    &r.commit.parent,
+                    suite,
+                    tail,
+                    path,
+                    &broken,
+                    &fixed,
+                    line,
+                    &t.name,
+                    &work_dir.display().to_string(),
+                );
+                writeln!(
+                    fh,
+                    "{}",
+                    serde_json::to_string(&ex).map_err(|e| e.to_string())?
+                )
+                .map_err(|e| e.to_string())?;
+                rows += 1;
+            }
+        }
+    }
+    std::fs::write(
+        out_dir.join("replays.json"),
+        serde_json::to_string_pretty(&assay.replays).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    flair::phase("ASSAY", "what the history actually contains");
+    let n = assay.replays.len();
+    for (label, note) in [
+        ("FIXED", "parent red, commit green — a verified repair"),
+        ("GREEN-BEFORE", "no test could see the change"),
+        ("STILL-RED", "suite cannot grade that point in history"),
+        (
+            "NO-GRADER-YET",
+            "the focused suite had not been written yet",
+        ),
+        ("UNRUNNABLE", "could not be replayed at all"),
+    ] {
+        let c = assay.count(label);
+        println!(
+            "  {:<14} {:>4}  {:>5.1}%  {}",
+            if label == "FIXED" {
+                flair::green(label)
+            } else {
+                flair::dim(label)
+            },
+            c,
+            c as f64 * 100.0 / n.max(1) as f64,
+            flair::dim(note)
+        );
+    }
+    println!(
+        "  {:<14} {}",
+        "rows written",
+        flair::bold(&rows.to_string())
+    );
+    println!(
+        "  {:<14} {}",
+        "wall clock",
+        flair::dim(&format!("{:.1}s", assay.wall_ms as f64 / 1000.0))
+    );
+    println!(
+        "\n  {} {}",
+        flair::ember("▸"),
+        flair::dim(&format!(
+            "rows: {}/history.jsonl · every replay: {}/replays.json",
+            out_dir.display(),
+            out_dir.display()
+        ))
+    );
+    Ok(())
 }
 
 fn cmd_operators() -> Result<(), String> {

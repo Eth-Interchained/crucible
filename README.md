@@ -87,7 +87,32 @@ Every one of these came from running the thing, not from reasoning about it.
 - **Grader breadth bought nothing.** 0 of 10 surviving mutations died when the grader went from 3 suites to 11. The focused subset is the same kill power at a quarter of the cost.
 - **Prompts must lead with the failure.** nedb's suites narrate every success, so a naive tail is 1,600 characters of `ok  SELECT LIMIT` with the defect scrolled off. Output is now focused on the last failure marker — and when no marker is recognised, the prompt **says so** rather than quietly containing the wrong thing.
 - **Harness paths are training-data poison.** Tracebacks from a worktree name a directory that will not exist at inference. They are rewritten to repo-relative.
+- **Harness paths leaked a second time, and I called the corpus clean.** `strip_worktree` removed the work dir but left the per-worker segment, so every row carried `w0/python/nedb/engine.py`. The verification I ran grepped for `/work/` and `crucible` — neither matches a bare leading `w0/` — so an incomplete check reported success on a corpus that was still poisoned. Fixed to consume the work dir *and* the segment after it, with the regression test that would have caught it.
+- **A grader that did not exist yet is not a failing grader.** Running `python3 tests/test_wrap_sqlite_shadow.py` against a commit from before that file was written exits 2, which scored as red — so "this test had not been written" was reported as "the suite cannot grade this era" for 64% of the first history run. That was one bug wearing a plausible explanation.
 - **`except_swallow` was broader than advertised.** It fired on an `except ImportError:` whose body was fallback *setup* (`import types as _types`), producing a missing-import bug whose own `NameError` names the fix — a copy-paste task mislabelled as silent-failure training. It now fires only where the handler raises, returns, or reports.
+
+## Two corpus sources
+
+### `crucible forge` — manufactured defects, unbounded
+
+Mutate a green tree, confirm a suite goes red, admit the repair. Synthetic, but limitless and difficulty-tunable.
+
+### `crucible history` — real defects, verified
+
+**A commit is a bug fix if the suite says so.** Check out its parent: red there and green at the commit means that commit repaired something the suite can see, and the diff is a label nobody had to write. Commit messages are never consulted — `fix:` in a subject is a claim, red-to-green is a verdict.
+
+Measured on nedb's last 30 source-touching commits:
+
+| outcome | | |
+|---|---|---|
+| `FIXED` | 3 (10.0%) | parent red, commit green — a verified repair |
+| `GREEN-BEFORE` | 26 (86.7%) | no test could see the change |
+| `STILL-RED` | 1 (3.3%) | suite cannot grade that era |
+| `NO-GRADER-YET` | 0 | the focused suite was not written yet |
+
+**History mining is a quality play, not a volume play.** 10% of commits yield rows; nedb's history is mostly release bumps and features, not test-covered bug fixes. Extrapolated across the 177 commits touching `python/nedb`, that is roughly **40 real rows** against ~1,200 synthetic ones. Worth having because the defects are ones humans actually shipped — and the diffs are correspondingly larger and harder (one mined row is a 26-line restructure, where every mutation repair is a single splice).
+
+What it recovered on its first real run, unprompted: `f4a5461` *"fix(wrap): backend='auto' must never silently downgrade durability"* and `390544b` *"fix(wrap): wrap_redis crashed on every install lacking the native wheel"* — two of the nine silent defects from 2026-09-08. And the best demonstration of why messages are not labels: `2f400cf` is tagged `docs:` and it repaired `test_wrap_redis`.
 
 ## Architecture
 
@@ -157,11 +182,14 @@ cargo install crucible-forge          # or: cargo build --release
 
 crucible operators                    # what each mutation does, and why
 crucible locate --repo /path/to/nedb  # candidate count per file, no execution
-crucible forge  --repo /path/to/nedb --workers 8 --out out --work work
-crucible forge  --repo /path/to/nedb --operator except_swallow --limit 200
+crucible forge   --repo /path/to/nedb --workers 8 --out out --work work
+crucible forge   --repo /path/to/nedb --operator except_swallow --limit 200
+crucible history --repo /path/to/nedb --limit 200     # needs a FULL clone
 ```
 
-Outputs `out/corpus.jsonl` (admitted rows) and `out/trials.json` (every trial, including survivors).
+Outputs `out/corpus.jsonl` (mutation rows), `out/history.jsonl` (mined rows), `out/trials.json` and `out/replays.json` (every verdict, including the unusable ones).
+
+`history` needs real depth — `git clone` without `--depth`, or `git fetch --unshallow`.
 
 **Requires** `git` ≥ 2.5 (worktrees), `python3` for the Python locator, and coreutils `timeout` — the deadline is enforced by `timeout -k` rather than a hand-rolled poll loop, because a hung suite can leave children behind and `timeout` already handles process-group teardown correctly.
 

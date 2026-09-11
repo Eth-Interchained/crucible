@@ -99,6 +99,22 @@ impl Worktree {
         git(&self.root, &["checkout", "--", &rel.display().to_string()]).map(|_| ())
     }
 
+    /// Move this worktree to another commit. Detached, forced: the tree is ours
+    /// and a local modification left by a previous step must never block a
+    /// replay — a checkout that silently refused would grade the WRONG commit
+    /// and report it as a verdict about this one.
+    pub fn checkout(&self, commit: &str) -> Result<(), String> {
+        git(
+            &self.root,
+            &["checkout", "--detach", "--force", "--quiet", commit],
+        )
+        .map(|_| ())?;
+        // `checkout -f` does not remove untracked files, and a stray .pyc or a
+        // leftover data directory from a previous suite run can change what the
+        // next suite sees. Clean is the only way the replay is comparable.
+        git(&self.root, &["clean", "-qfdx"]).map(|_| ())
+    }
+
     /// Is the worktree exactly its commit? Called before admitting an example,
     /// because a trial verified against an accidentally-dirty tree is a
     /// mislabelled row, and a mislabelled row is worse than a missing one.

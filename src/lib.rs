@@ -34,6 +34,7 @@
 
 pub mod flair;
 pub mod forge;
+pub mod history;
 pub mod locate;
 pub mod model;
 pub mod render;
