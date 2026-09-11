@@ -239,6 +239,7 @@ fn a_missing_grader_is_not_a_failing_grader() {
         name: "ghost".into(),
         argv: vec!["definitely-not-a-real-binary-xyzzy".into()],
         env: vec![],
+        hermetic: true,
     };
     let r = crate::verify::run_grader(std::path::Path::new("."), &g, 3_000)
         .expect("timeout itself must run");
@@ -258,5 +259,54 @@ fn a_missing_grader_is_not_a_failing_grader() {
     assert!(
         !err.contains("is not green on an unmutated tree"),
         "must NOT blame the target's tests: {err}"
+    );
+}
+
+#[test]
+fn the_non_hermetic_grader_is_named_and_dropped_when_parallel() {
+    // THE BUG THAT POISONED A CORPUS. nedb's test_deploy starts a daemon on a
+    // HARDCODED port — `PORT = 7172  # isolated port so it never collides with
+    // a running nedbd`. The author guarded against an external daemon, not
+    // against a second copy of the suite. With two workers both bind 7172: one
+    // wins, and the loser either fails to start its daemon or TALKS TO THE
+    // WINNER'S, which is serving the winner's MUTATED code. Worker A's mutation
+    // then turns worker B's trial red and the kill is credited to B.
+    //
+    // Measured: candidates that a single worker proves survive 0/10 came back
+    // as a 45% kill rate under two workers. `crucible eval` exposed it — the
+    // oracle, replaying each row's own correct repair, scored 38.9% and half
+    // the rows reported their own broken state as GREEN.
+    let t = Target::nedb_preset("/nowhere");
+    let bad: Vec<&str> = t.non_hermetic().iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(
+        bad,
+        vec!["test_deploy"],
+        "the fixed-port suite must be flagged"
+    );
+
+    // Serial: everything is available.
+    let serial = t.graders_for_parallel("python/nedb/engine.py", false);
+    assert!(serial.iter().any(|g| g.name == "test_deploy"));
+
+    // Parallel: it is gone, because including it corrupts attribution.
+    let par = t.graders_for_parallel("python/nedb/engine.py", true);
+    assert!(
+        !par.iter().any(|g| g.name == "test_deploy"),
+        "a fixed-port grader must not run under multiple workers"
+    );
+    assert!(
+        !par.is_empty(),
+        "dropping it must not empty the grader list"
+    );
+}
+
+#[test]
+fn hermetic_defaults_to_true_so_a_new_target_is_not_silently_serialised() {
+    let t = Target::nedb_rust_preset("/nowhere");
+    assert!(t.non_hermetic().is_empty());
+    assert_eq!(
+        t.graders_for_parallel("rust/nedb-v2/src/db.rs", true).len(),
+        t.graders_for_parallel("rust/nedb-v2/src/db.rs", false)
+            .len()
     );
 }

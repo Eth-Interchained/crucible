@@ -60,6 +60,16 @@ pub enum Verdict {
     /// see is a hang, not an assertion, and because a hang is the one outcome
     /// that can starve a whole run if it is not bounded.
     Timeout { suite: String, limit_ms: u64 },
+    /// The suite went red on the mutated tree AND on the pristine tree, checked
+    /// back-to-back in the same worktree under the same load. The failure is
+    /// real but the mutation did not cause it — a flaky or load-sensitive suite.
+    ///
+    /// This verdict exists because its absence poisoned a corpus. On a 2-core
+    /// box with two workers, `test_proof` credited 11 of 18 kills, including for
+    /// a mutation that provably cannot execute. Attributing those to the
+    /// candidate produced rows whose "broken" state is green, which `crucible
+    /// eval` then caught as the oracle scoring 38.9% instead of 100%.
+    Flaky { suite: String },
     /// Every suite passed. The mutation is invisible to the target's tests: a
     /// coverage gap. Useless as a training pair (there is no failing output to
     /// put in the prompt) and valuable as a report.
@@ -67,13 +77,17 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// A kill is a defect the suite detected BECAUSE of the mutation. A flaky
+    /// red is not a kill, and counting it as one is how a corpus gets rows whose
+    /// broken state is green.
     pub fn killed(&self) -> bool {
-        !matches!(self, Verdict::Survived)
+        matches!(self, Verdict::Failed { .. } | Verdict::Timeout { .. })
     }
     pub fn label(&self) -> &'static str {
         match self {
             Verdict::Failed { .. } => "FAILED",
             Verdict::Timeout { .. } => "TIMEOUT",
+            Verdict::Flaky { .. } => "FLAKY",
             Verdict::Survived => "SURVIVED",
         }
     }

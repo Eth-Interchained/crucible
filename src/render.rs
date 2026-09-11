@@ -210,7 +210,10 @@ fn describe(v: &Verdict) -> (String, String) {
                  unreachable — rather than a failed assertion."
             ),
         ),
-        Verdict::Survived => (String::new(), String::new()),
+        // Neither of these becomes a row: a survivor has no failing output to
+        // put in a prompt, and a flaky red was not caused by the mutation, so
+        // the "repair" would not be a repair.
+        Verdict::Flaky { .. } | Verdict::Survived => (String::new(), String::new()),
     }
 }
 

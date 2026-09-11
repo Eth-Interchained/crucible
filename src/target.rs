@@ -18,6 +18,32 @@ pub struct Grader {
     /// PYTHONPATH that must be absolute still works inside a throwaway tree.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Can two copies of this grader run AT THE SAME TIME on one machine?
+    ///
+    /// A WORKTREE IS NOT ISOLATION IF THE GRADER REACHES OUTSIDE IT. nedb's
+    /// `test_deploy` starts a daemon on a HARDCODED port — `PORT = 7172  #
+    /// isolated port so it never collides with a running nedbd`. The author
+    /// guarded against an external daemon, not against a second copy of the
+    /// suite. With two workers both bind 7172: one wins, and the loser either
+    /// fails to start its daemon or, far worse, TALKS TO THE WINNER'S DAEMON —
+    /// which is serving the winner's MUTATED code. Worker A's mutation then
+    /// turns worker B's trial red, and the kill is attributed to B's candidate.
+    ///
+    /// That produced a partially poisoned corpus and a 45% "kill rate" for
+    /// candidates that a single worker proves survive 0/10. It was found by
+    /// `crucible eval`: the oracle, which replays each row's own correct repair,
+    /// scored 38.9% instead of 100%, and half the rows reported that their own
+    /// broken state was GREEN.
+    ///
+    /// Default TRUE, because most graders are hermetic and a false default
+    /// would silently serialise every fleet. A target that is wrong about this
+    /// produces mislabelled rows, so it is worth being explicit.
+    #[serde(default = "yes")]
+    pub hermetic: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +79,23 @@ pub struct Target {
 }
 
 impl Target {
+    /// Graders that are unsafe to run concurrently.
+    pub fn non_hermetic(&self) -> Vec<&Grader> {
+        self.graders.iter().filter(|g| !g.hermetic).collect()
+    }
+
+    /// Graders for a given file, focused subset first.
+    ///
+    /// `parallel` drops the non-hermetic ones: with more than one worker they
+    /// do not merely fail, they CROSS-ATTRIBUTE — see `Grader::hermetic`.
+    pub fn graders_for_parallel(&self, file: &str, parallel: bool) -> Vec<&Grader> {
+        let mut g = self.graders_for(file);
+        if parallel {
+            g.retain(|x| x.hermetic);
+        }
+        g
+    }
+
     /// Graders for a given file, focused subset first.
     pub fn graders_for(&self, file: &str) -> Vec<&Grader> {
         for (needle, names) in &self.focus {
@@ -130,6 +173,9 @@ impl Target {
                 // operator sets CARGO_TARGET_DIR per worker if they want to skip
                 // the cold build.
                 env: vec![],
+                // cargo takes a lock on the target dir, and each worktree has
+                // its own, so concurrent copies are safe.
+                hermetic: true,
             }],
             focus: vec![],
             slow: vec![],
@@ -173,6 +219,11 @@ impl Target {
                     name: (*s).into(),
                     argv: vec!["python3".into(), format!("tests/{s}.py")],
                     env: vec![("PYTHONPATH".into(), "{REPO}/python".into())],
+                    // test_deploy binds a hardcoded port (7172) and starts a
+                    // daemon, so two copies cannot run at once. See
+                    // Grader::hermetic — this one field is the difference
+                    // between a clean corpus and a poisoned one.
+                    hermetic: *s != "test_deploy",
                 })
                 .collect(),
             focus: vec![

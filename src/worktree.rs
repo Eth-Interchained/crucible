@@ -122,6 +122,16 @@ impl Worktree {
         Ok(git(&self.root, &["status", "--porcelain"])?.is_empty())
     }
 
+    /// Which files are dirty, for an error message that can be acted on.
+    /// "the tree is dirty" sends someone hunting; naming the file does not.
+    pub fn dirty_files(&self) -> Result<Vec<String>, String> {
+        Ok(git(&self.root, &["status", "--porcelain"])?
+            .lines()
+            .map(|l| l.get(3..).unwrap_or(l).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

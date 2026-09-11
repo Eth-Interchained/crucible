@@ -9,7 +9,7 @@
 //! only what a real suite proved was detectable, and report the rest as a
 //! coverage finding.
 
-use crucible::{flair, forge, history, locate, pairs, render, report, target::Target};
+use crucible::{eval, flair, forge, history, locate, pairs, render, report, target::Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         Some("locate") => cmd_locate(&args[1..]),
         Some("history") => cmd_history(&args[1..]),
         Some("pairs") => cmd_pairs(&args[1..]),
+        Some("eval") => cmd_eval(&args[1..]),
         Some("operators") => cmd_operators(),
         _ => {
             eprintln!(
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
                  \x20                [--limit N] [--operator OP] [--out DIR] [--work DIR]\n\
                  \x20 crucible history --repo PATH [--limit N] [--out DIR] [--work DIR]\n\
                  \x20 crucible pairs --repo PATH --trials FILE [--limit N] [--seed N]\n\
+                 \x20 crucible eval --repo PATH --corpus FILE [--model oracle|null|cheat]\n\
                  \x20 crucible locate --repo PATH [--file REL]\n\
                  \x20 crucible operators\n"
             );
@@ -457,6 +459,13 @@ fn cmd_pairs(args: &[String]) -> Result<(), String> {
                     format!("two-site — caught by {suite}")
                 }
                 crucible::model::Verdict::Timeout { suite, .. } => format!("{suite} hung"),
+                // The pair path does not confirm kills yet — only the single
+                // forge does. Stated rather than papered over: a Flaky here
+                // would be a bug in this arm, not a real verdict, so it says so
+                // instead of pretending to be a category it cannot produce.
+                crucible::model::Verdict::Flaky { suite } => {
+                    format!("{suite} red on a clean tree too — pair verdict unreliable")
+                }
                 crucible::model::Verdict::Survived => {
                     format!("both still invisible (L{})", p.b.line)
                 }
@@ -569,6 +578,160 @@ fn cmd_pairs(args: &[String]) -> Result<(), String> {
         flair::ember("▸"),
         flair::dim(&format!("rows: {}/pairs.jsonl", out_dir.display()))
     );
+    Ok(())
+}
+
+/// `crucible eval` — does a model actually repair the defect?
+///
+/// Execution-gated like everything else: no judge model is asked whether a patch
+/// looks right. The patch is applied to the broken tree and the real suite runs.
+///
+/// RUN `--model oracle` FIRST, ALWAYS. It replays each row's own completion and
+/// must score 100%. Anything less means the HARNESS is broken — the
+/// reconstruction, the patch application, or the grader — and any number it
+/// reports about a real model is meaningless. On a prior project the eval
+/// harness was wrong seven times before it was right, and each time it was
+/// measuring something other than what it claimed.
+fn cmd_eval(args: &[String]) -> Result<(), String> {
+    let repo = flag(args, "--repo").ok_or("--repo is required")?;
+    let repo = PathBuf::from(&repo)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize --repo {repo}: {e}"))?;
+    let corpus_path = flag(args, "--corpus")
+        .ok_or("--corpus FILE is required (out/corpus.jsonl from a forge run)")?;
+    let limit: usize = flag(args, "--limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let work_dir = PathBuf::from(flag(args, "--work").unwrap_or_else(|| "work".into()));
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+    let work_dir = work_dir.canonicalize().map_err(|e| e.to_string())?;
+
+    let mut rows = eval::load_corpus(std::path::Path::new(&corpus_path))?;
+    rows.truncate(limit);
+    if rows.is_empty() {
+        return Err(format!("{corpus_path} has no rows"));
+    }
+
+    let responder: Box<dyn eval::Responder> = match flag(args, "--model").as_deref() {
+        Some("null") => Box::new(eval::Null),
+        Some("cheat") => Box::new(eval::Cheat {
+            // The suite most rows are graded by, so the cheat is plausible.
+            test_path: "tests/test_nedb.py".into(),
+        }),
+        // Default is the oracle, deliberately: the first thing anyone runs
+        // should be the thing that validates the harness.
+        _ => Box::new(eval::Oracle),
+    };
+
+    let t = Target::nedb_preset(&repo.display().to_string());
+    let head = crucible::worktree::head_commit(&repo)?;
+    flair::banner(&t.name, &head, rows.len(), t.graders.len(), 1);
+    flair::phase(
+        "EVAL",
+        &format!("{} rows · responder `{}`", rows.len(), responder.name()),
+    );
+    if responder.name() == "oracle" {
+        flair::note(
+            "the oracle replays each row's OWN completion — it must score 100%, and \
+             anything less indicts this harness rather than the corpus",
+        );
+    }
+
+    flair::phase(
+        "BASELINE",
+        "the grader must be green before anything is broken",
+    );
+    let probe = crucible::worktree::Worktree::create(&repo, &work_dir, "ebase", &head)?;
+    let all = t.all_graders();
+    let base = crucible::verify::measure_baseline(&probe.root, &all, 120_000, |n, ms, d, ok| {
+        flair::baseline(n, ms, d, ok);
+    })?;
+    drop(probe);
+
+    flair::phase("SCORE", "break the tree, ask, apply, re-grade");
+    let wt = crucible::worktree::Worktree::create(&repo, &work_dir, "eval", &head)?;
+    let started = std::time::Instant::now();
+    let mut results = Vec::new();
+    for (i, ex) in rows.iter().enumerate() {
+        let r = eval::score_one(&wt, &t, &base, ex, responder.as_ref())?;
+        let note = match &r.score {
+            eval::Score::Solved => "suite went green".to_string(),
+            eval::Score::NotFixed { suite } => format!("{suite} still red"),
+            eval::Score::Malformed { why } => why.chars().take(64).collect(),
+            eval::Score::Cheated { touched } => {
+                format!("patched {} — outside the contract", touched.join(","))
+            }
+            eval::Score::RowDidNotReproduce => "the ROW is bad: broken state was green".into(),
+        };
+        flair::trial(
+            i + 1,
+            rows.len(),
+            match r.score.label() {
+                "SOLVED" => "FAILED", // flair's green tag
+                "CHEATED" | "BAD-ROW" | "MALFORMED" => "ABORT",
+                _ => "SURVIVED",
+            },
+            &r.operator,
+            "silent",
+            &r.file,
+            ex.line,
+            r.score.label(),
+            r.elapsed_ms,
+            &note,
+        );
+        results.push(r);
+    }
+    let _ = wt.checkout(&head);
+    drop(wt);
+
+    let n = results.len();
+    let solved = results.iter().filter(|r| r.score.solved()).count();
+    flair::phase("SCOREBOARD", &format!("responder `{}`", responder.name()));
+    for label in ["SOLVED", "MISSED", "MALFORMED", "CHEATED", "BAD-ROW"] {
+        let c = results.iter().filter(|r| r.score.label() == label).count();
+        let line = format!(
+            "  {:<14} {:>4}  {:>5.1}%",
+            label,
+            c,
+            c as f64 * 100.0 / n as f64
+        );
+        println!(
+            "{}",
+            match label {
+                "SOLVED" => flair::green(&line),
+                "CHEATED" | "BAD-ROW" => {
+                    if c > 0 {
+                        flair::red(&line)
+                    } else {
+                        flair::dim(&line)
+                    }
+                }
+                _ => flair::dim(&line),
+            }
+        );
+    }
+    println!(
+        "\n  {:<14} {}",
+        "pass@1",
+        flair::bold(&format!("{:.1}%", solved as f64 * 100.0 / n as f64))
+    );
+    println!(
+        "  {:<14} {}",
+        "wall clock",
+        flair::dim(&format!("{:.1}s", started.elapsed().as_secs_f64()))
+    );
+
+    // A harness that cannot solve its own corpus is not a scoreboard, and
+    // saying so LOUDLY matters more than exiting zero.
+    if responder.name() == "oracle" && solved != n {
+        println!();
+        flair::warn(&format!(
+            "THE ORACLE DID NOT SCORE 100% ({solved}/{n}). This harness is broken, not the \
+             corpus — every row's own completion is by construction a correct repair. Do not \
+             trust any eval number until this reads {n}/{n}."
+        ));
+        return Err("oracle below 100% — harness defect".into());
+    }
     Ok(())
 }
 

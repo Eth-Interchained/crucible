@@ -32,6 +32,7 @@
 //! - **Survivors are a product, not a failure.** A mutation no test notices is a
 //!   coverage gap in the target. Those are reported, never silently dropped.
 
+pub mod eval;
 pub mod flair;
 pub mod forge;
 pub mod history;
