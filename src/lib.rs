@@ -43,6 +43,7 @@ pub mod pairs;
 pub mod render;
 pub mod report;
 pub mod target;
+pub mod teacher;
 pub mod verify;
 pub mod worktree;
 
