@@ -6,3 +6,8 @@ __pycache__/
 *.pyc
 locators/rust-locate/target/
 rout/
+o1/
+o2/
+o3/
+w2/
+w3/

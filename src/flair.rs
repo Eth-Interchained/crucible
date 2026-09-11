@@ -123,6 +123,9 @@ pub fn trial(
         "FAILED" => green(" KILLED "),
         "TIMEOUT" => magenta(" HUNG   "),
         "SURVIVED" => yellow(" BLIND  "),
+        // A flaky red is louder than a survivor: it means the TARGET's suite is
+        // unreliable under load, which is a finding about the repo.
+        "FLAKY" => red(" FLAKY  "),
         _ => dim(" ?      "),
     };
     // A silent operator that nothing caught is the single most interesting line

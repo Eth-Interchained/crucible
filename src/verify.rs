@@ -184,6 +184,40 @@ pub fn measure_baseline(
     Ok(Baseline { ms, deadline_ms })
 }
 
+/// Confirm a kill by re-grading the SAME suite on a PRISTINE tree, right now.
+///
+/// THE HOLE THIS CLOSES, and it produced a partially poisoned corpus before it
+/// was found. The baseline proves the grader is green ONCE, before any work. It
+/// does not prove the grader is green AT THE MOMENT OF A KILL — and on a
+/// loaded box that difference is the whole ballgame.
+///
+/// Measured on a 2-core machine: with two workers, `test_proof` credited 11 of
+/// 18 kills, including for a mutation that provably cannot matter
+/// (`__has_native__ = True -> False` on an install where `_native` is not
+/// importable, so the line never executes; the suite passes 33/33 with it
+/// applied). The failure was real but it was not caused by the mutation — CPU
+/// contention surfaces a latent race in the TARGET, whose manifest ticker
+/// interleaves with the test's own writes and produces a corrupt hash
+/// (`ValueError: non-hexadecimal number found in fromhex() arg at position 65`
+/// — a BLAKE2b hex is 64 characters, so position 65 is two records spliced
+/// together).
+///
+/// So every kill is now re-tested against a clean tree in the same worktree
+/// under the same load. If the pristine tree is ALSO red, the suite is flaky or
+/// load-sensitive and the mutation gets no credit for it. Cheap, because it only
+/// runs for candidates that already went red.
+pub fn confirm_kill(cwd: &Path, grader: &Grader, base: &Baseline) -> Result<bool, String> {
+    let d = base.deadline_for(&grader.name);
+    let r = run_grader(cwd, grader, d)?;
+    if r.not_executable {
+        return Err(format!(
+            "the grader `{}` stopped being executable while confirming a kill",
+            grader.name
+        ));
+    }
+    Ok(r.ok)
+}
+
 /// Grade a mutated tree. Stops at the first red suite — the verdict is "some
 /// test catches this", and which one caught it first is the diagnostic an agent
 /// would have seen.

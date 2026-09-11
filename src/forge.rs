@@ -269,11 +269,47 @@ pub fn run(target: &Target, opts: &Opts) -> Result<Assay, String> {
                         continue;
                     }
 
-                    let graders = target.graders_for(&rel_s);
+                    // Non-hermetic graders are dropped when more than one
+                    // worker is running. This is not a performance choice: two
+                    // copies of a grader that binds a fixed port cross-attribute
+                    // their failures, so keeping them would poison the corpus.
+                    let graders = target.graders_for_parallel(&rel_s, opts.workers > 1);
                     let names: Vec<String> = graders.iter().map(|g| g.name.clone()).collect();
                     let t0 = Instant::now();
                     let verdict = verify::grade(&wt.root, &graders, base);
                     let elapsed_ms = t0.elapsed().as_millis() as u64;
+
+                    // CONFIRM THE KILL AGAINST A CLEAN TREE, NOW.
+                    //
+                    // The baseline proved the grader green once, before any
+                    // work. It did not prove it green at THIS moment under THIS
+                    // load, and that gap poisoned a corpus: on a 2-core box with
+                    // two workers, test_proof credited 11 of 18 kills, including
+                    // for a mutation that provably cannot execute. So the file
+                    // is restored and the accusing suite re-run immediately. If
+                    // the clean tree is also red, the suite is flaky or
+                    // load-sensitive and the mutation gets no credit.
+                    let verdict = match verdict {
+                        Ok(v) if v.killed() => {
+                            let suite = match &v {
+                                crate::model::Verdict::Failed { suite, .. } => suite.clone(),
+                                crate::model::Verdict::Timeout { suite, .. } => suite.clone(),
+                                _ => String::new(),
+                            };
+                            match wt.restore(&job.rel) {
+                                Ok(()) => match graders.iter().find(|g| g.name == suite) {
+                                    Some(g) => match verify::confirm_kill(&wt.root, g, base) {
+                                        Ok(true) => Ok(v),
+                                        Ok(false) => Ok(crate::model::Verdict::Flaky { suite }),
+                                        Err(e) => Err(e),
+                                    },
+                                    None => Ok(v),
+                                },
+                                Err(e) => Err(format!("restore before confirm: {e}")),
+                            }
+                        }
+                        other => other,
+                    };
 
                     // Restore before anything else can go wrong. Not deferred,
                     // not trusted to the next splice: a dirty worktree turns
@@ -309,6 +345,9 @@ pub fn run(target: &Target, opts: &Opts) -> Result<Assay, String> {
                         crate::model::Verdict::Failed { suite, .. } => format!("caught by {suite}"),
                         crate::model::Verdict::Timeout { suite, limit_ms } => {
                             format!("{suite} exceeded {limit_ms} ms")
+                        }
+                        crate::model::Verdict::Flaky { suite } => {
+                            format!("{suite} is red on a CLEAN tree too — not the mutation")
                         }
                         crate::model::Verdict::Survived => {
                             // A count, not ten suite names: the survivor lines
