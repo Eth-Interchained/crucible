@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+
+  # The locator is the part that must agree with the interpreter, so it is
+  # exercised against a real Python file on every supported version rather than
+  # trusted to the Rust suite.
+  locator:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: locate against the locator itself
+        run: |
+          set -euo pipefail
+          python3 locators/python_locate.py locators/python_locate.py > out.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("out.json"))
+          assert d.get("error") is None, d["error"]
+          assert len(d["candidates"]) > 20, f"suspiciously few candidates: {len(d['candidates'])}"
+          # Every candidate must round-trip: the span it names must contain the
+          # bytes it claims, and the splice must still compile. A locator that
+          # is wrong about either produces a corrupted file rather than a bug.
+          src = open("locators/python_locate.py", "rb").read()
+          for c in d["candidates"]:
+              got = src[c["start_byte"]:c["end_byte"]].decode()
+              assert got == c["before"], (c["operator"], c["line"], got, c["before"])
+              spliced = src[:c["start_byte"]] + c["after"].encode() + src[c["end_byte"]:]
+              compile(spliced, "x.py", "exec")
+          print(f"{len(d['candidates'])} candidates, all spans exact and all splices compile")
+          PY

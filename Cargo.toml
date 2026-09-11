@@ -1,0 +1,26 @@
+[package]
+name = "crucible-forge"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+description = "Execution-gated training corpus forge. No label without a verdict from a real test suite."
+repository = "https://github.com/Eth-Interchained/crucible"
+homepage = "https://github.com/Eth-Interchained/crucible"
+authors = ["Interchained LLC"]
+readme = "README.md"
+keywords = ["mutation-testing", "training-data", "llm", "corpus"]
+categories = ["development-tools::testing"]
+exclude = ["out/*", "work/*", "target/*"]
+
+[[bin]]
+name = "crucible"
+path = "src/main.rs"
+
+[lib]
+name = "crucible"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

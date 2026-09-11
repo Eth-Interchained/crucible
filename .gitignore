@@ -1,0 +1,6 @@
+target/
+work/
+out/
+Cargo.lock.bak
+__pycache__/
+*.pyc
