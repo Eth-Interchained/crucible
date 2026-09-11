@@ -38,6 +38,7 @@ pub mod forge;
 pub mod history;
 pub mod locate;
 pub mod model;
+pub mod nql;
 pub mod outlock;
 pub mod pairs;
 pub mod render;
