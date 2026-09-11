@@ -119,16 +119,39 @@ impl Teacher {
             .to_string()
     }
 
+    /// POST one chat completion with an arbitrary system prompt.
+    ///
+    /// Public because the repair task is no longer the only caller: the NQL
+    /// factory needs the same transport with a different instruction and a
+    /// different temperature (diversity when paraphrasing, determinism when
+    /// translating back). Sharing the transport keeps the thinking-model trap,
+    /// the temp-file body and the error reporting in ONE place — three
+    /// behaviours that were each learned the hard way and should not be
+    /// re-derived per call site.
+    pub fn complete(&self, system: &str, user: &str, temperature: f32) -> Result<String, String> {
+        self.post(system, user, temperature).map(|(c, _)| c)
+    }
+
     /// POST one chat completion and return `(content, reasoning)`.
     fn ask(&self, prompt: &str) -> Result<(String, Option<String>), String> {
+        let sys = self.system_prompt();
+        self.post(&sys, prompt, self.temperature)
+    }
+
+    fn post(
+        &self,
+        system: &str,
+        prompt: &str,
+        temperature: f32,
+    ) -> Result<(String, Option<String>), String> {
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self.system_prompt()},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
+            "temperature": temperature,
         });
 
         // Body via a temp file, not an argv string. A prompt carries newlines,

@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         Some("history") => cmd_history(&args[1..]),
         Some("pairs") => cmd_pairs(&args[1..]),
         Some("eval") => cmd_eval(&args[1..]),
+        Some("nql") => cmd_nql(&args[1..]),
         Some("operators") => cmd_operators(),
         _ => {
             eprintln!(
@@ -49,6 +50,8 @@ fn main() -> ExitCode {
                  \x20 crucible eval --repo PATH --corpus FILE [--model oracle|null|cheat|teacher]\n\
                  \x20                [--teacher-model NAME] [--endpoint URL]\n\
                  \x20                [--teacher-max-tokens N] [--transcript FILE]\n\
+                 \x20 crucible nql --cast PATH --teacher-model NAME [--plans N]\n\
+                 \x20                [--variants N] [--endpoint URL] [--out FILE]\n\
                  \x20 crucible locate --repo PATH [--file REL]\n\
                  \x20 crucible operators\n"
             );
@@ -797,6 +800,110 @@ fn cmd_eval(args: &[String]) -> Result<(), String> {
              (c). Do not trust any eval number until this reads {n}/{n}."
         ));
         return Err("oracle below 100% — harness defect".into());
+    }
+    Ok(())
+}
+
+/// `crucible nql` — the NQL translator factory.
+///
+/// Same rule as the mutation forge, different language: no label without a
+/// verdict. There the verdict is a suite going red; here it is the parser
+/// recovering the same plan from the teacher's own English.
+fn cmd_nql(args: &[String]) -> Result<(), String> {
+    let cast = flag(args, "--cast")
+        .or_else(|| std::env::var("CRUCIBLE_CAST_REPO").ok())
+        .ok_or("--cast PATH is required — point it at a nedb-cast-slm checkout")?;
+    let cast = PathBuf::from(&cast)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize --cast {cast}: {e}"))?;
+    // The bridge imports nedb.query. Naming the checkout explicitly means a
+    // missing import fails at startup with a path in the message, instead of as
+    // a ModuleNotFoundError on the first request.
+    let nedb_python = flag(args, "--nedb-python")
+        .or_else(|| std::env::var("CRUCIBLE_NEDB_PYTHON").ok())
+        .map(PathBuf::from);
+
+    let teacher_model = flag(args, "--teacher-model")
+        .or_else(|| std::env::var("CRUCIBLE_TEACHER_MODEL").ok())
+        .ok_or("--teacher-model NAME is required (e.g. glm-5.3-flash)")?;
+    let endpoint = flag(args, "--endpoint")
+        .or_else(|| std::env::var("CRUCIBLE_TEACHER_ENDPOINT").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+
+    let mut teacher = crucible::teacher::Teacher::new(&endpoint, &teacher_model);
+    if let Some(v) = flag(args, "--teacher-max-tokens").and_then(|v| v.parse().ok()) {
+        teacher.max_tokens = v;
+    }
+    if let Some(v) = flag(args, "--teacher-timeout").and_then(|v| v.parse().ok()) {
+        teacher.timeout_secs = v;
+    }
+    // Never a flag: a key in argv is a key in every ps listing on the box.
+    teacher.api_key = std::env::var("CRUCIBLE_TEACHER_KEY").ok();
+
+    let cfg = crucible::nql::NqlConfig {
+        cast_repo: cast,
+        nedb_python,
+        plans: flag(args, "--plans")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200),
+        variants: flag(args, "--variants")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+        seed: flag(args, "--seed")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1337),
+        out: PathBuf::from(flag(args, "--out").unwrap_or_else(|| "out/nql.jsonl".into())),
+    };
+
+    println!(
+        "{}",
+        flair::bold("CRUCIBLE nql  english -> NQL, verified by round trip")
+    );
+    println!(
+        "{}",
+        flair::dim(&format!(
+            "  teacher {teacher_model} at {endpoint} · {} plan(s) x {} · seed {}",
+            cfg.plans, cfg.variants, cfg.seed
+        ))
+    );
+
+    let tally = std::sync::Mutex::new(crucible::nql::Tally::default());
+    let rows = crucible::nql::forge_nql(&cfg, &teacher, &tally)?;
+    crucible::nql::write_pairs(&cfg.out, &rows)?;
+
+    let t = tally.lock().unwrap();
+    println!();
+    println!(
+        "{}",
+        flair::bold("▌ ASSAY english the teacher could not decode is discarded")
+    );
+    println!("  plans                {}", t.plans);
+    println!("  prompts offered      {}", t.offered);
+    println!(
+        "  {}          {}  {:.1}%",
+        flair::green("VERIFIED"),
+        t.verified,
+        t.rate() * 100.0
+    );
+    // Named apart on purpose: these have different fixes. Ambiguous English
+    // means rewrite the paraphrase instruction; unparseable means the teacher
+    // needs the grammar spelled out more plainly.
+    println!(
+        "  mismatch             {}  (round-tripped to a DIFFERENT plan — the English was ambiguous)",
+        t.mismatch
+    );
+    println!(
+        "  unparseable          {}  (the teacher's NQL did not parse)",
+        t.unparseable
+    );
+    println!("  teacher errors       {}", t.teacher_errors);
+    println!();
+    println!("  {}", flair::dim(&format!("rows: {}", cfg.out.display())));
+
+    if t.verified == 0 {
+        // A zero-row corpus is a failed run. Exiting 0 would let a pipeline
+        // carry on as though it had data.
+        return Err("no prompt survived the round trip — see the counts above".into());
     }
     Ok(())
 }
